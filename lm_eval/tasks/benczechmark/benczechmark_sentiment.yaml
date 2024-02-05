@@ -1,6 +1,6 @@
 group:
-  - benchczechmark
-task: benchczechmark_sentiment
+  - benczechmark
+task: benczechmark_sentiment
 dataset_path: CZLC/czech_sentiment
 dataset_name:
 output_type: multiple_choice

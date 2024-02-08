@@ -108,8 +108,8 @@ class HFLM(LM):
             assert not parallelize, "`parallelize=True` is not compatible with passing pre-initialized model to `pretrained`"
             self._model = pretrained
             self._device = self._model.device
-
             self._config = self._model.config
+            gpus = 0
 
             if tokenizer:
                 assert isinstance(
@@ -239,6 +239,16 @@ class HFLM(LM):
             if self.config.model_type == "qwen":
                 # Qwen's trust_remote_code tokenizer does not allow for adding special tokens
                 self.tokenizer.pad_token = "<|endoftext|>"
+            elif (
+                self.tokenizer.__class__.__name__ == "RWKVWorldTokenizer"
+                or self.tokenizer.__class__.__name__ == "Rwkv5Tokenizer"
+            ):
+                # The RWKV world tokenizer, does not allow for adding special tokens / setting the pad token (which is set as 0)
+                # The additional tokenizer name check is needed, as there exists rwkv4 models with neox tokenizer
+                # ---
+                # Note that the world tokenizer class name, might change in the future for the final huggingface merge
+                # https://github.com/huggingface/transformers/pull/26963
+                assert self.tokenizer.pad_token_id == 0
             else:
                 self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
@@ -362,7 +372,7 @@ class HFLM(LM):
 
     def _get_backend(
         self,
-        config: transformers.AutoConfig,
+        config: Union[transformers.PretrainedConfig, transformers.AutoConfig],
         backend: Optional[Literal["default", "causal", "seq2seq"]] = "default",
         trust_remote_code: Optional[bool] = False,
     ) -> None:
@@ -607,7 +617,13 @@ class HFLM(LM):
 
             return batch_size
 
-        batch_size = forward_batch()
+        try:
+            batch_size = forward_batch()
+        except RuntimeError as e:
+            if "No executable batch size found" in str(e):
+                batch_size = 1
+            else:
+                raise
 
         if self.world_size > 1:
             # if multi-GPU, always take minimum over all selected batch sizes
@@ -705,12 +721,14 @@ class HFLM(LM):
                 return self.model(inps).logits
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
+        # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
         # remove temperature, as do_sample=False takes care of this
         # and we don't want a warning from HF
+        generation_kwargs["temperature"] = generation_kwargs.get("temperature", 0.0)
         do_sample = generation_kwargs.get("do_sample", None)
-        if do_sample is False and "temperature" == 0.0:
-            generation_kwargs.pop("temperature", 0.0)
+        if do_sample is False and generation_kwargs.get("temperature") == 0.0:
+            generation_kwargs.pop("temperature")
         # build stopping criteria
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
@@ -1047,6 +1065,7 @@ class HFLM(LM):
             return -len(toks), x[0]
 
         pbar = tqdm(total=len(requests), disable=(self.rank != 0))
+        adaptive_batch_size = None
         if self.batch_size == "auto":
             # using rolling window with maximum context
             print("Passed argument batch_size = auto. Detecting largest batch size")
@@ -1091,7 +1110,7 @@ class HFLM(LM):
                         )
             else:
                 raise ValueError(
-                    f"Expected `kwargs` to be of type `dict` but got {kwargs}"
+                    f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}"
                 )
             if not until:
                 until = [self.tok_decode(self.eot_token_id)]
